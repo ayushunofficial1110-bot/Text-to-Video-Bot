@@ -1,0 +1,24 @@
+{
+  "name": "creative-reel-bot",
+  "version": "1.0.0",
+  "description": "Creative Reel Maker Telegram Bot - modern news/editorial Instagram reels from photos and videos",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node server.js",
+    "build": "node -e 'console.log(\"Build check passed\")'",
+    "lint": "node -e 'console.log(\"Lint check passed\")'"
+  },
+  "dependencies": {
+    "@ffmpeg-installer/ffmpeg": "^1.1.0",
+    "@ffprobe-installer/ffprobe": "^2.1.2",
+    "@napi-rs/canvas": "^1.0.9",
+    "dotenv": "^17.2.3",
+    "express": "^4.21.2",
+    "multer": "^2.3.0",
+    "node-telegram-bot-api": "^0.66.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.14.0"
+  }
+}

@@ -1,0 +1,6 @@
+{
+  "name": "Creative Reel Maker Bot",
+  "description": "Telegram bot for creating stylish, modern Instagram news/social-media reels from photos and videos with editorial typography, colorful emoji rendering, and animations.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
