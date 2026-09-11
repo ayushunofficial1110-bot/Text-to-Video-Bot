@@ -1268,6 +1268,11 @@ async function processUserReel(chatId, text) {
 }
 
 function initTelegramBot() {
+  if (process.env.DISABLE_BOT === 'true' || process.env.ENABLE_BOT === 'false') {
+    console.log('[Telegram Bot] ⏸️ Bot polling is disabled via DISABLE_BOT=true. Only web preview is active.');
+    return;
+  }
+
   if (!BOT_TOKEN || BOT_TOKEN === 'YOUR_TELEGRAM_BOT_TOKEN') {
     console.log('[Telegram Bot] ⚠️ No BOT_TOKEN detected. Waiting for token in environment variables.');
     return;
