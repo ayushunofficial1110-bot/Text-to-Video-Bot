@@ -295,6 +295,17 @@ async function getEmojiImage(emojiChar) {
  * with graceful fallback to cached image/Twemoji or system text.
  */
 async function drawEmoji(ctx, emojiChar, x, y, size, isTopBaseline = false) {
+  // 1. Prioritize vibrant Twemoji PNG first for guaranteed full-color rendering
+  try {
+    const img = await getEmojiImage(emojiChar);
+    if (img) {
+      const drawY = isTopBaseline ? y : y - size * 0.85;
+      ctx.drawImage(img, x, drawY, size, size);
+      return true;
+    }
+  } catch (_) {}
+
+  // 2. Fallback to Noto Color Emoji / font
   try {
     ctx.save();
     ctx.font = `${size}px "Noto Color Emoji", "NotoColorEmoji", sans-serif`;
@@ -306,19 +317,15 @@ async function drawEmoji(ctx, emojiChar, x, y, size, isTopBaseline = false) {
     return true;
   } catch (err) {
     try {
-      const img = await getEmojiImage(emojiChar);
-      if (img) {
-        const drawY = isTopBaseline ? y : y - size * 0.85;
-        ctx.drawImage(img, x, drawY, size, size);
-        return true;
-      }
-    } catch (_) {}
-    ctx.save();
-    ctx.font = `${size}px sans-serif`;
-    if (isTopBaseline) ctx.textBaseline = 'top';
-    ctx.fillText(emojiChar, x, y);
-    ctx.restore();
-    return false;
+      ctx.save();
+      ctx.font = `${size}px sans-serif`;
+      if (isTopBaseline) ctx.textBaseline = 'top';
+      ctx.fillText(emojiChar, x, y);
+      ctx.restore();
+      return false;
+    } catch (_) {
+      return false;
+    }
   }
 }
 
@@ -548,68 +555,209 @@ function extractLeadingBadges(rawText) {
   };
 }
 
+const ACCENT_COLORS = {
+  blue: '#38bdf8',
+  red: '#ef4444',
+  green: '#10b981',
+  orange: '#f59e0b',
+  purple: '#a855f7',
+  white: '#ffffff'
+};
+
+function resolveAccentColor(choice, style) {
+  if (choice && typeof choice === 'string') {
+    const lower = choice.toLowerCase().trim();
+    if (ACCENT_COLORS[lower]) return ACCENT_COLORS[lower];
+    if (lower.startsWith('#')) return lower;
+  }
+  if (style === 'breaking') return '#ef4444';
+  if (style === 'split') return '#f43f5e';
+  return '#38bdf8';
+}
+
+function resolveFontSize(choice, textLength) {
+  if (choice === 'small') return 40;
+  if (choice === 'medium') return 48;
+  if (choice === 'large') return 58;
+  if (typeof choice === 'number') return choice;
+  if (textLength > 110) return 40;
+  if (textLength > 65) return 48;
+  return 54;
+}
+
+function smartAutoDetect(text) {
+  const upper = (text || '').toUpperCase();
+  const detectedBadges = [];
+
+  // News / Alert Badges
+  if (upper.includes('JUST IN') || text.includes('🔴')) {
+    detectedBadges.push('🔴 JUST IN');
+  } else if (upper.includes('BREAKING') || text.includes('🚨')) {
+    detectedBadges.push('🚨 BREAKING');
+  }
+  if (upper.includes('TRENDING') || upper.includes('VIRAL') || text.includes('🔥')) {
+    detectedBadges.push('🔥 TRENDING');
+  }
+  if (upper.includes('UPDATE') || text.includes('⚡')) {
+    detectedBadges.push('⚡ UPDATE');
+  }
+  if (upper.includes('EXCLUSIVE') || text.includes('👑')) {
+    detectedBadges.push('👑 EXCLUSIVE');
+  }
+  if (upper.includes('GLOBAL') || upper.includes('WORLD') || text.includes('🌍')) {
+    detectedBadges.push('🌍 GLOBAL');
+  }
+
+  // Country flags
+  if (upper.includes('SOUTH AFRICA') || upper.includes('RAMAPHOSA') || text.includes('🇿🇦')) {
+    detectedBadges.push('🇿🇦');
+  }
+  if (upper.includes('INDIA') || upper.includes('MODI') || upper.includes('DELHI') || text.includes('🇮🇳')) {
+    detectedBadges.push('🇮🇳');
+  }
+  if (upper.includes('USA') || upper.includes('AMERICA') || upper.includes('BIDEN') || upper.includes('TRUMP') || upper.includes('WASHINGTON') || text.includes('🇺🇸')) {
+    detectedBadges.push('🇺🇸');
+  }
+  if (upper.includes('UK') || upper.includes('BRITAIN') || upper.includes('LONDON') || text.includes('🇬🇧')) {
+    detectedBadges.push('🇬🇧');
+  }
+  if (upper.includes('EU') || upper.includes('EUROPE') || upper.includes('BRUSSELS') || text.includes('🇪🇺')) {
+    detectedBadges.push('🇪🇺');
+  }
+  if (upper.includes('JAPAN') || upper.includes('TOKYO') || text.includes('🇯🇵')) {
+    detectedBadges.push('🇯🇵');
+  }
+
+  // Any other leading emoji flags in the text itself
+  const leading = extractLeadingBadges(text);
+  for (const flag of leading.flags) {
+    if (!detectedBadges.includes(flag)) {
+      detectedBadges.unshift(flag);
+    }
+  }
+
+  const style = detectStyle(text);
+  return {
+    style,
+    badges: detectedBadges
+  };
+}
+
+/**
+ * Renders badges or flags row at startY with alignment
+ */
+async function renderBadgesRow(ctx, badges, startY, align = 'left', accentColor = '#38bdf8') {
+  if (!badges || badges.length === 0) return 0;
+
+  const items = [];
+  let totalWidth = 0;
+  for (const b of badges.slice(0, 4)) {
+    const isSingleEmoji = /^\p{Emoji}$/u.test(b) || (b.length <= 4 && !b.includes(' '));
+    if (isSingleEmoji) {
+      items.push({ type: 'emoji', value: b, width: 68 });
+      totalWidth += 68 + 12;
+    } else {
+      ctx.save();
+      ctx.font = getFontStyleString('bold', 20, 'Montserrat');
+      const textW = ctx.measureText(b).width;
+      ctx.restore();
+      const pillW = Math.round(textW + 36);
+      items.push({ type: 'pill', value: b, width: pillW });
+      totalWidth += pillW + 12;
+    }
+  }
+  if (items.length > 0) totalWidth -= 12;
+
+  let curX = align === 'center' ? Math.round((1080 - totalWidth) / 2) : 90;
+  for (const item of items) {
+    if (item.type === 'emoji') {
+      await drawEmoji(ctx, item.value, curX, startY, 56, true);
+      curX += item.width + 12;
+    } else {
+      ctx.fillStyle = accentColor;
+      ctx.beginPath();
+      ctx.roundRect(curX, startY + 4, item.width, 46, 23);
+      ctx.fill();
+
+      ctx.fillStyle = '#ffffff';
+      ctx.font = getFontStyleString('bold', 20, 'Montserrat');
+      ctx.fillText(item.value, curX + 18, startY + 34);
+      curX += item.width + 12;
+    }
+  }
+  return 60;
+}
+
 /**
  * Creates a high-end 1080x1920 transparent PNG overlay with creative editorial styling
  */
 async function generateCreativeOverlay(rawText, styleHint = null, options = {}) {
   if (!rawText || !rawText.trim()) return null;
 
-  const style = styleHint || detectStyle(rawText);
+  let style = styleHint || options.style || 'auto';
+  if (style === 'auto') {
+    style = detectStyle(rawText);
+  }
+
   const { flags, headline } = extractLeadingBadges(rawText);
   const contentText = headline || rawText;
+
   const requestedFont = options.font || options.fontFamily || null;
   const headlineFont = resolveFontFamily(requestedFont, style);
+
+  const accentColor = resolveAccentColor(options.accent, style);
+  const fontSize = resolveFontSize(options.size, contentText.length);
+  const align = options.align === 'center' ? 'center' : 'left';
+
+  let activeBadges = [];
+  if (options.badges && Array.isArray(options.badges) && options.badges.length > 0) {
+    activeBadges = [...options.badges];
+  } else if (flags.length > 0) {
+    activeBadges = [...flags];
+  }
 
   const canvas = createCanvas(1080, 1920);
   const ctx = canvas.getContext('2d');
 
   if (style === 'editorial') {
     // --- STYLE 1: EDITORIAL (CLASSIC NEWS HEADLINE) ---
-    // Smooth top dark gradient vignette so video/photo is visible underneath with high contrast
-    const grad = ctx.createLinearGradient(0, 0, 0, 760);
-    grad.addColorStop(0, 'rgba(8, 12, 22, 0.94)');
-    grad.addColorStop(0.55, 'rgba(8, 12, 22, 0.82)');
+    const grad = ctx.createLinearGradient(0, 0, 0, 780);
+    grad.addColorStop(0, 'rgba(8, 12, 22, 0.95)');
+    grad.addColorStop(0.55, 'rgba(8, 12, 22, 0.84)');
     grad.addColorStop(0.85, 'rgba(8, 12, 22, 0.40)');
     grad.addColorStop(1, 'rgba(8, 12, 22, 0)');
     ctx.fillStyle = grad;
-    ctx.fillRect(0, 0, 1080, 760);
+    ctx.fillRect(0, 0, 1080, 780);
 
-    let topY = 120;
-    let badgeX = 90;
+    const topY = 135;
+    if (activeBadges.length > 0) {
+      await renderBadgesRow(ctx, activeBadges, topY, align, accentColor);
+    } else {
+      ctx.fillStyle = 'rgba(255, 255, 255, 0.10)';
+      ctx.beginPath();
+      ctx.roundRect(810, topY + 8, 180, 44, 22);
+      ctx.fill();
+      ctx.strokeStyle = 'rgba(255, 255, 255, 0.20)';
+      ctx.lineWidth = 1;
+      ctx.stroke();
 
-    // Prominent country flags or badges
-    if (flags.length > 0) {
-      for (const flag of flags.slice(0, 3)) {
-        await drawEmoji(ctx, flag, badgeX, topY, 64, true);
-        badgeX += 80;
-      }
+      ctx.fillStyle = '#94a3b8';
+      ctx.font = getFontStyleString('bold', 18, 'Montserrat');
+      ctx.fillText('GLOBAL DESK', 835, topY + 36);
     }
 
-    // Source Tag / Pill on the top right
-    ctx.fillStyle = 'rgba(255, 255, 255, 0.10)';
-    ctx.beginPath();
-    ctx.roundRect(810, topY + 8, 180, 44, 22);
-    ctx.fill();
-    ctx.strokeStyle = 'rgba(255, 255, 255, 0.20)';
-    ctx.lineWidth = 1;
-    ctx.stroke();
-
-    ctx.fillStyle = '#94a3b8';
-    ctx.font = getFontStyleString('bold', 18, 'Montserrat');
-    ctx.fillText('GLOBAL DESK', 835, topY + 36);
-
-    // Dynamic Headline Typography
-    const fontSize = contentText.length > 100 ? 42 : contentText.length > 60 ? 48 : 54;
     const lineHeight = fontSize * 1.25;
     ctx.font = getFontStyleString('bold', fontSize, headlineFont);
 
     const tokens = tokenizeText(contentText);
     const wrappedLines = wrapTokens(tokens, ctx, 900, fontSize, headlineFont);
 
-    let textY = topY + 130;
+    let textY = topY + (activeBadges.length > 0 ? 110 : 90);
 
     for (const line of wrappedLines.slice(0, 6)) {
-      let curX = 90;
+      const lineWidth = line.width;
+      let curX = align === 'center' ? Math.round(90 + (900 - lineWidth) / 2) : 90;
+
       for (const tok of line.tokens) {
         if (tok.type === 'emoji') {
           await drawEmoji(ctx, tok.value, curX, textY, fontSize, false);
@@ -628,49 +776,44 @@ async function generateCreativeOverlay(rawText, styleHint = null, options = {}) 
       textY += lineHeight;
     }
 
-    // Modern vibrant cyan accent rule
-    ctx.fillStyle = '#38bdf8';
+    ctx.fillStyle = accentColor;
+    const barW = 85;
+    const barX = align === 'center' ? Math.round((1080 - barW) / 2) : 90;
     ctx.beginPath();
-    ctx.roundRect(90, textY + 12, 80, 6, 3);
+    ctx.roundRect(barX, textY + 14, barW, 6, 3);
     ctx.fill();
 
   } else if (style === 'breaking') {
     // --- STYLE 2: BREAKING NEWS ---
-    // Filmic dark gradient vignette on upper third
     const grad = ctx.createLinearGradient(0, 0, 0, 820);
-    grad.addColorStop(0, 'rgba(0, 0, 0, 0.92)');
-    grad.addColorStop(0.65, 'rgba(0, 0, 0, 0.75)');
+    grad.addColorStop(0, 'rgba(0, 0, 0, 0.94)');
+    grad.addColorStop(0.65, 'rgba(0, 0, 0, 0.78)');
     grad.addColorStop(1, 'rgba(0, 0, 0, 0)');
     ctx.fillStyle = grad;
     ctx.fillRect(0, 0, 1080, 820);
 
-    const startY = 135;
+    const startY = 140;
 
-    // Prominent Red Breaking Badge
-    ctx.fillStyle = '#dc2626';
-    ctx.beginPath();
-    ctx.roundRect(90, startY, 220, 50, 25);
-    ctx.fill();
+    if (activeBadges.length > 0) {
+      await renderBadgesRow(ctx, activeBadges, startY, align, accentColor);
+    } else {
+      const badgeW = 220;
+      const badgeX = align === 'center' ? Math.round((1080 - badgeW) / 2) : 90;
+      ctx.fillStyle = accentColor;
+      ctx.beginPath();
+      ctx.roundRect(badgeX, startY, badgeW, 50, 25);
+      ctx.fill();
 
-    // Glowing indicator dot
-    ctx.fillStyle = '#ffffff';
-    ctx.beginPath();
-    ctx.arc(120, startY + 25, 7, 0, Math.PI * 2);
-    ctx.fill();
+      ctx.fillStyle = '#ffffff';
+      ctx.beginPath();
+      ctx.arc(badgeX + 30, startY + 25, 7, 0, Math.PI * 2);
+      ctx.fill();
 
-    ctx.font = getFontStyleString('bold', 22, 'Montserrat');
-    ctx.fillStyle = '#ffffff';
-    ctx.fillText('JUST IN', 140, startY + 33);
-
-    // Any leading flags next to the badge
-    let flagX = 330;
-    for (const flag of flags.slice(0, 2)) {
-      await drawEmoji(ctx, flag, flagX, startY - 2, 54, true);
-      flagX += 68;
+      ctx.font = getFontStyleString('bold', 22, 'Montserrat');
+      ctx.fillStyle = '#ffffff';
+      ctx.fillText('BREAKING', badgeX + 50, startY + 33);
     }
 
-    // Large Impact Headline
-    const fontSize = contentText.length > 80 ? 46 : 54;
     const lineHeight = fontSize * 1.25;
     ctx.font = getFontStyleString('bold', fontSize, headlineFont);
 
@@ -680,7 +823,9 @@ async function generateCreativeOverlay(rawText, styleHint = null, options = {}) 
     let textY = startY + 115;
 
     for (const line of wrappedLines.slice(0, 7)) {
-      let curX = 90;
+      const lineWidth = line.width;
+      let curX = align === 'center' ? Math.round(90 + (900 - lineWidth) / 2) : 90;
+
       for (const tok of line.tokens) {
         if (tok.type === 'emoji') {
           await drawEmoji(ctx, tok.value, curX, textY, fontSize, false);
@@ -699,19 +844,19 @@ async function generateCreativeOverlay(rawText, styleHint = null, options = {}) 
       textY += lineHeight;
     }
 
-    // Sub-accent: Red indicator line
-    ctx.fillStyle = '#ef4444';
+    ctx.fillStyle = accentColor;
+    const barW = 95;
+    const barX = align === 'center' ? Math.round((1080 - barW) / 2) : 90;
     ctx.beginPath();
-    ctx.roundRect(90, textY + 14, 90, 5, 2.5);
+    ctx.roundRect(barX, textY + 14, barW, 6, 3);
     ctx.fill();
 
   } else if (style === 'split') {
     // --- STYLE 4: SPLIT EDITORIAL (NEWS CARD CONTAINER) ---
-    const cardY = 90;
+    const cardY = 110;
     const cardWidth = 920;
-    const cardX = (1080 - cardWidth) / 2; // 80px margins
+    const cardX = (1080 - cardWidth) / 2;
 
-    const fontSize = contentText.length > 80 ? 44 : 50;
     const lineHeight = fontSize * 1.26;
     ctx.font = getFontStyleString('bold', fontSize, headlineFont);
 
@@ -719,39 +864,36 @@ async function generateCreativeOverlay(rawText, styleHint = null, options = {}) 
     const wrappedLines = wrapTokens(tokens, ctx, 840, fontSize, headlineFont);
 
     const totalLines = Math.min(wrappedLines.length, 6);
-    const cardHeight = 110 + (totalLines * lineHeight) + 60;
+    const cardHeight = 120 + (totalLines * lineHeight) + 60;
 
-    // Frosted dark slate card container
     ctx.fillStyle = 'rgba(12, 17, 29, 0.96)';
     ctx.beginPath();
     ctx.roundRect(cardX, cardY, cardWidth, cardHeight, 26);
     ctx.fill();
 
-    // Delicate 1.5px border
     ctx.strokeStyle = 'rgba(255, 255, 255, 0.14)';
     ctx.lineWidth = 1.5;
     ctx.stroke();
 
-    // Card Header row (Flags + Dispatch Pill)
-    let headerY = cardY + 40;
+    let headerY = cardY + 36;
     let curFlagX = cardX + 40;
 
-    if (flags.length > 0) {
-      for (const flag of flags.slice(0, 3)) {
-        await drawEmoji(ctx, flag, curFlagX, headerY, 56, true);
-        curFlagX += 72;
+    if (activeBadges.length > 0) {
+      for (const badge of activeBadges.slice(0, 3)) {
+        await drawEmoji(ctx, badge, curFlagX, headerY, 52, true);
+        curFlagX += 68;
       }
     } else {
-      ctx.fillStyle = '#ef4444';
+      ctx.fillStyle = accentColor;
       ctx.beginPath();
       ctx.roundRect(curFlagX, headerY + 6, 110, 36, 18);
       ctx.fill();
       ctx.fillStyle = '#ffffff';
       ctx.font = getFontStyleString('bold', 16, 'Montserrat');
-      ctx.fillText('NEWS', curFlagX + 32, headerY + 30);
+      ctx.fillText('DISPATCH', curFlagX + 18, headerY + 30);
+      curFlagX += 130;
     }
 
-    // Source Tag on right
     ctx.fillStyle = 'rgba(255, 255, 255, 0.08)';
     ctx.beginPath();
     ctx.roundRect(cardX + cardWidth - 180, headerY + 6, 140, 38, 19);
@@ -761,15 +903,16 @@ async function generateCreativeOverlay(rawText, styleHint = null, options = {}) 
     ctx.stroke();
     ctx.fillStyle = '#94a3b8';
     ctx.font = getFontStyleString('bold', 16, 'Montserrat');
-    ctx.fillText('DISPATCH', cardX + cardWidth - 152, headerY + 31);
+    ctx.fillText('EDITION', cardX + cardWidth - 146, headerY + 31);
 
-    // Headline Text
     let curY = headerY + 95;
     ctx.font = getFontStyleString('bold', fontSize, headlineFont);
     ctx.fillStyle = '#ffffff';
 
     for (const line of wrappedLines.slice(0, 6)) {
-      let curX = cardX + 40;
+      const lineWidth = line.width;
+      let curX = align === 'center' ? Math.round(cardX + 40 + (840 - lineWidth) / 2) : cardX + 40;
+
       for (const tok of line.tokens) {
         if (tok.type === 'emoji') {
           await drawEmoji(ctx, tok.value, curX, curY, fontSize, false);
@@ -782,19 +925,19 @@ async function generateCreativeOverlay(rawText, styleHint = null, options = {}) 
       curY += lineHeight;
     }
 
-    // Accent line
-    ctx.fillStyle = '#f43f5e';
+    ctx.fillStyle = accentColor;
+    const barW = 80;
+    const barX = align === 'center' ? Math.round(cardX + (cardWidth - barW) / 2) : cardX + 40;
     ctx.beginPath();
-    ctx.roundRect(cardX + 40, curY + 6, 70, 5, 2.5);
+    ctx.roundRect(barX, curY + 6, barW, 6, 3);
     ctx.fill();
 
   } else if (style === 'minimal') {
     // --- STYLE 5: MINIMAL NEWS ---
-    const cardY = 120;
+    const cardY = 140;
     const cardWidth = 920;
     const cardX = 80;
 
-    const fontSize = 48;
     const lineHeight = fontSize * 1.30;
     ctx.font = getFontStyleString('bold', fontSize, headlineFont);
 
@@ -803,8 +946,7 @@ async function generateCreativeOverlay(rawText, styleHint = null, options = {}) 
     const totalLines = Math.min(wrappedLines.length, 5);
     const cardHeight = 90 + (totalLines * lineHeight) + 50;
 
-    // Charcoal translucent card
-    ctx.fillStyle = 'rgba(10, 15, 26, 0.90)';
+    ctx.fillStyle = 'rgba(10, 15, 26, 0.92)';
     ctx.beginPath();
     ctx.roundRect(cardX, cardY, cardWidth, cardHeight, 22);
     ctx.fill();
@@ -813,22 +955,24 @@ async function generateCreativeOverlay(rawText, styleHint = null, options = {}) 
     ctx.lineWidth = 1.2;
     ctx.stroke();
 
-    // Minimal kicker
-    ctx.fillStyle = '#38bdf8';
+    ctx.fillStyle = accentColor;
     ctx.beginPath();
-    ctx.arc(cardX + 46, cardY + 44, 4, 0, Math.PI * 2);
+    ctx.arc(cardX + 46, cardY + 44, 5, 0, Math.PI * 2);
     ctx.fill();
 
     ctx.fillStyle = '#94a3b8';
     ctx.font = getFontStyleString('bold', 16, 'Montserrat');
-    ctx.fillText('NEWS REEL • BRIEFING', cardX + 60, cardY + 50);
+    const badgeLabel = activeBadges.length > 0 ? activeBadges.join(' ') : 'NEWS REEL • BRIEFING';
+    ctx.fillText(badgeLabel, cardX + 60, cardY + 50);
 
     let curY = cardY + 105;
     ctx.font = getFontStyleString('bold', fontSize, headlineFont);
     ctx.fillStyle = '#f8fafc';
 
     for (const line of wrappedLines.slice(0, 5)) {
-      let curX = cardX + 40;
+      const lineWidth = line.width;
+      let curX = align === 'center' ? Math.round(cardX + 40 + (840 - lineWidth) / 2) : cardX + 40;
+
       for (const tok of line.tokens) {
         if (tok.type === 'emoji') {
           await drawEmoji(ctx, tok.value, curX, curY, fontSize, false);
@@ -843,7 +987,7 @@ async function generateCreativeOverlay(rawText, styleHint = null, options = {}) 
 
   } else {
     // --- STYLE 3: FULL SCREEN (CINEMATIC LOWER-THIRD SCRIM) ---
-    const scrimHeight = 920;
+    const scrimHeight = 940;
     const scrimStartY = 1920 - scrimHeight;
 
     const grad = ctx.createLinearGradient(0, scrimStartY, 0, 1920);
@@ -854,26 +998,22 @@ async function generateCreativeOverlay(rawText, styleHint = null, options = {}) 
     ctx.fillStyle = grad;
     ctx.fillRect(0, scrimStartY, 1080, scrimHeight);
 
-    let textStartY = 1360;
+    let textStartY = 1380;
 
-    // Flags or Category pill
-    let flagX = 90;
-    if (flags.length > 0) {
-      for (const flag of flags.slice(0, 3)) {
-        await drawEmoji(ctx, flag, flagX, textStartY - 90, 56, true);
-        flagX += 70;
-      }
+    if (activeBadges.length > 0) {
+      await renderBadgesRow(ctx, activeBadges, textStartY - 90, align, accentColor);
     } else {
+      const pillW = 160;
+      const pillX = align === 'center' ? Math.round((1080 - pillW) / 2) : 90;
       ctx.fillStyle = 'rgba(255, 255, 255, 0.15)';
       ctx.beginPath();
-      ctx.roundRect(90, textStartY - 80, 160, 40, 20);
+      ctx.roundRect(pillX, textStartY - 80, pillW, 40, 20);
       ctx.fill();
-      ctx.fillStyle = '#38bdf8';
+      ctx.fillStyle = accentColor;
       ctx.font = getFontStyleString('bold', 18, 'Montserrat');
-      ctx.fillText('TOP STORY', 115, textStartY - 54);
+      ctx.fillText('TOP STORY', pillX + 25, textStartY - 54);
     }
 
-    const fontSize = contentText.length > 90 ? 44 : 50;
     const lineHeight = fontSize * 1.28;
     ctx.font = getFontStyleString('bold', fontSize, headlineFont);
 
@@ -884,7 +1024,9 @@ async function generateCreativeOverlay(rawText, styleHint = null, options = {}) 
     ctx.fillStyle = '#ffffff';
 
     for (const line of wrappedLines.slice(0, 5)) {
-      let curX = 90;
+      const lineWidth = line.width;
+      let curX = align === 'center' ? Math.round(90 + (900 - lineWidth) / 2) : 90;
+
       for (const tok of line.tokens) {
         if (tok.type === 'emoji') {
           await drawEmoji(ctx, tok.value, curX, textY, fontSize, false);
@@ -1010,12 +1152,137 @@ const generateTextOverlayPNG = NodeCanvasOverlayModule.generateTextOverlayPNG;
 const buildFFmpegOverlayFilter = NodeCanvasOverlayModule.buildFFmpegOverlayFilter;
 
 /**
+ * Creates procedural backdrop composites for Photo Reels (Studio, City, Cyber)
+ */
+async function createBackdropComposite(photoPath, backdrop, outputPath) {
+  const canvas = createCanvas(1080, 1920);
+  const ctx = canvas.getContext('2d');
+
+  if (backdrop === 'studio') {
+    const bgGrad = ctx.createLinearGradient(0, 0, 0, 1920);
+    bgGrad.addColorStop(0, '#0a1128');
+    bgGrad.addColorStop(0.5, '#050914');
+    bgGrad.addColorStop(1, '#020408');
+    ctx.fillStyle = bgGrad;
+    ctx.fillRect(0, 0, 1080, 1920);
+
+    const radGrad = ctx.createRadialGradient(540, 700, 40, 540, 700, 650);
+    radGrad.addColorStop(0, 'rgba(56, 189, 248, 0.22)');
+    radGrad.addColorStop(0.6, 'rgba(99, 102, 241, 0.12)');
+    radGrad.addColorStop(1, 'rgba(0, 0, 0, 0)');
+    ctx.fillStyle = radGrad;
+    ctx.fillRect(0, 0, 1080, 1920);
+
+    ctx.fillStyle = 'rgba(255, 255, 255, 0.03)';
+    for (let i = 0; i < 5; i++) {
+      ctx.beginPath();
+      ctx.arc(200 + i * 160, 650 + (i % 2) * 100, 60 + i * 15, 0, Math.PI * 2);
+      ctx.fill();
+    }
+  } else if (backdrop === 'city') {
+    const bgGrad = ctx.createLinearGradient(0, 0, 0, 1920);
+    bgGrad.addColorStop(0, '#0f0c29');
+    bgGrad.addColorStop(0.6, '#302b63');
+    bgGrad.addColorStop(1, '#24243e');
+    ctx.fillStyle = bgGrad;
+    ctx.fillRect(0, 0, 1080, 1920);
+
+    const amberGrad = ctx.createRadialGradient(540, 1600, 100, 540, 1600, 800);
+    amberGrad.addColorStop(0, 'rgba(245, 158, 11, 0.25)');
+    amberGrad.addColorStop(1, 'transparent');
+    ctx.fillStyle = amberGrad;
+    ctx.fillRect(0, 1000, 1080, 920);
+  } else {
+    // Cyber Grid
+    const bgGrad = ctx.createLinearGradient(0, 0, 1080, 1920);
+    bgGrad.addColorStop(0, '#060b19');
+    bgGrad.addColorStop(1, '#111827');
+    ctx.fillStyle = bgGrad;
+    ctx.fillRect(0, 0, 1080, 1920);
+
+    ctx.strokeStyle = 'rgba(56, 189, 248, 0.12)';
+    ctx.lineWidth = 2;
+    const gridSpacing = 80;
+    for (let x = 0; x <= 1080; x += gridSpacing) {
+      ctx.beginPath(); ctx.moveTo(x, 0); ctx.lineTo(x, 1920); ctx.stroke();
+    }
+    for (let y = 0; y <= 1920; y += gridSpacing) {
+      ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(1080, y); ctx.stroke();
+    }
+  }
+
+  // Draw user photo in central broadcast card
+  const img = await loadImage(photoPath);
+  const targetX = 70;
+  const targetY = 460;
+  const targetW = 940;
+  const targetH = 1040;
+  const radius = 24;
+
+  ctx.save();
+  ctx.shadowColor = 'rgba(0, 0, 0, 0.75)';
+  ctx.shadowBlur = 32;
+  ctx.shadowOffsetY = 16;
+  ctx.beginPath();
+  ctx.roundRect(targetX, targetY, targetW, targetH, radius);
+  ctx.fillStyle = '#000000';
+  ctx.fill();
+  ctx.restore();
+
+  ctx.save();
+  ctx.beginPath();
+  ctx.roundRect(targetX, targetY, targetW, targetH, radius);
+  ctx.clip();
+
+  const imgRatio = img.width / img.height;
+  const boxRatio = targetW / targetH;
+  let drawW, drawH, drawX, drawY;
+  if (imgRatio > boxRatio) {
+    drawH = targetH;
+    drawW = targetH * imgRatio;
+    drawX = targetX - (drawW - targetW) / 2;
+    drawY = targetY;
+  } else {
+    drawW = targetW;
+    drawH = targetW / imgRatio;
+    drawX = targetX;
+    drawY = targetY - (drawH - targetH) / 2;
+  }
+  ctx.drawImage(img, drawX, drawY, drawW, drawH);
+  ctx.restore();
+
+  ctx.save();
+  ctx.strokeStyle = 'rgba(255, 255, 255, 0.20)';
+  ctx.lineWidth = 2.5;
+  ctx.beginPath();
+  ctx.roundRect(targetX, targetY, targetW, targetH, radius);
+  ctx.stroke();
+  ctx.restore();
+
+  fs.writeFileSync(outputPath, canvas.toBuffer('image/jpeg'));
+  return outputPath;
+}
+
+/**
  * Creates an exactly 5-second 1080x1920 MP4 from a Photo with Ken Burns motion
  */
-async function renderPhotoReel({ photoPath, outputPath, text, styleHint, fontHint }) {
+async function renderPhotoReel({ photoPath, outputPath, text, styleHint, fontHint, options = {} }) {
   let overlayPath = null;
   if (text && text.trim()) {
-    overlayPath = await generateCreativeOverlay(text.trim(), styleHint, { font: fontHint });
+    overlayPath = await generateCreativeOverlay(text.trim(), styleHint, {
+      font: fontHint,
+      ...options
+    });
+  }
+
+  let finalPhotoInput = photoPath;
+  let tempBackdropComposite = null;
+
+  const backdrop = options.backdrop || 'original';
+  if (backdrop && backdrop !== 'original') {
+    tempBackdropComposite = path.join(TEMP_DIR, `comp_bg_${Date.now()}_${Math.random().toString(36).substring(2, 7)}.jpg`);
+    await createBackdropComposite(photoPath, backdrop, tempBackdropComposite);
+    finalPhotoInput = tempBackdropComposite;
   }
 
   return new Promise((resolve, reject) => {
@@ -1026,17 +1293,16 @@ async function renderPhotoReel({ photoPath, outputPath, text, styleHint, fontHin
     let command = '';
 
     if (overlayPath) {
-      // Loop overlay image so it provides infinite continuous frames, fade in smoothly, overlay with shortest=1
       const filterComplex = `[0:v]${kenBurnsFilter}[bg];[1:v]format=rgba,fade=t=in:st=0:d=0.4:alpha=1[ov];[bg][ov]overlay=0:0:shortest=1:repeatlast=1:format=auto[v]`;
-      command = `"${FFMPEG_BIN}" -y -loop 1 -i "${photoPath}" -loop 1 -i "${overlayPath}" -f lavfi -i anullsrc=channel_layout=stereo:sample_rate=44100 -filter_complex "${filterComplex}" -map "[v]" -map 2:a -c:v libx264 -pix_fmt yuv420p -r 30 -t 5 -c:a aac -b:a 128k -shortest -movflags +faststart "${outputPath}"`;
+      command = `"${FFMPEG_BIN}" -y -loop 1 -i "${finalPhotoInput}" -loop 1 -i "${overlayPath}" -f lavfi -i anullsrc=channel_layout=stereo:sample_rate=44100 -filter_complex "${filterComplex}" -map "[v]" -map 2:a -c:v libx264 -pix_fmt yuv420p -r 30 -t 5 -c:a aac -b:a 128k -shortest -movflags +faststart "${outputPath}"`;
     } else {
-      // Clean video without text (exact 5 seconds)
-      command = `"${FFMPEG_BIN}" -y -loop 1 -i "${photoPath}" -f lavfi -i anullsrc=channel_layout=stereo:sample_rate=44100 -vf "${kenBurnsFilter}" -c:v libx264 -pix_fmt yuv420p -r 30 -t 5 -c:a aac -b:a 128k -shortest -movflags +faststart "${outputPath}"`;
+      command = `"${FFMPEG_BIN}" -y -loop 1 -i "${finalPhotoInput}" -f lavfi -i anullsrc=channel_layout=stereo:sample_rate=44100 -vf "${kenBurnsFilter}" -c:v libx264 -preset veryfast -pix_fmt yuv420p -r 30 -t 5 -c:a aac -b:a 128k -shortest -movflags +faststart "${outputPath}"`;
     }
 
     console.log('[Media Engine] Rendering Photo -> 5-Second Reel...');
     exec(command, { timeout: 60000 }, (error, stdout, stderr) => {
       cleanFile(overlayPath);
+      if (tempBackdropComposite) cleanFile(tempBackdropComposite);
       if (error) {
         console.error('[Render Photo Error]:', error.message, stderr);
         return reject(new Error('Photo rendering failed'));
@@ -1049,38 +1315,36 @@ async function renderPhotoReel({ photoPath, outputPath, text, styleHint, fontHin
 /**
  * Creates a 1080x1920 MP4 from Video preserving ORIGINAL DURATION and audio
  */
-async function renderVideoReel({ videoPath, outputPath, text, styleHint, fontHint }) {
+async function renderVideoReel({ videoPath, outputPath, text, styleHint, fontHint, options = {} }) {
   const probe = await probeMedia(videoPath);
   console.log(`[Media Engine] Video input: duration=${probe.duration}s, audio=${probe.hasAudio}`);
 
   let overlayPath = null;
   if (text && text.trim()) {
-    overlayPath = await generateCreativeOverlay(text.trim(), styleHint, { font: fontHint });
+    overlayPath = await generateCreativeOverlay(text.trim(), styleHint, {
+      font: fontHint,
+      ...options
+    });
   }
 
   return new Promise((resolve, reject) => {
-    // Intelligent 9:16 vertical crop/scale without stretching
     const baseVideoFilter = 'scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,setsar=1';
-
     let command = '';
 
     if (overlayPath) {
-      // Use the FFmpeg filter_complex that overlays the generated PNG onto the source video
-      // stream using the 'overlay' filter to ensure it remains visible throughout the entire duration
       const filterComplex = NodeCanvasOverlayModule.buildFFmpegOverlayFilter();
 
       if (probe.hasAudio) {
-        command = `"${FFMPEG_BIN}" -y -i "${videoPath}" -loop 1 -i "${overlayPath}" -filter_complex "${filterComplex}" -map "[v]" -map 0:a:0 -c:v libx264 -pix_fmt yuv420p -r 30 -c:a aac -b:a 128k -shortest -movflags +faststart "${outputPath}"`;
+        command = `"${FFMPEG_BIN}" -y -i "${videoPath}" -loop 1 -i "${overlayPath}" -filter_complex "${filterComplex}" -map "[v]" -map 0:a:0 -c:v libx264 -preset veryfast -pix_fmt yuv420p -r 30 -c:a aac -b:a 128k -shortest -movflags +faststart "${outputPath}"`;
       } else {
         const durationArg = probe.duration > 0 ? `-t ${probe.duration}` : '';
-        command = `"${FFMPEG_BIN}" -y -i "${videoPath}" -loop 1 -i "${overlayPath}" -f lavfi ${durationArg} -i anullsrc=channel_layout=stereo:sample_rate=44100 -filter_complex "${filterComplex}" -map "[v]" -map 2:a -c:v libx264 -pix_fmt yuv420p -r 30 -c:a aac -b:a 128k -shortest -movflags +faststart "${outputPath}"`;
+        command = `"${FFMPEG_BIN}" -y -i "${videoPath}" -loop 1 -i "${overlayPath}" -f lavfi ${durationArg} -i anullsrc=channel_layout=stereo:sample_rate=44100 -filter_complex "${filterComplex}" -map "[v]" -map 2:a -c:v libx264 -preset veryfast -pix_fmt yuv420p -r 30 -c:a aac -b:a 128k -shortest -movflags +faststart "${outputPath}"`;
       }
     } else {
-      // Clean video without text (preserving original duration)
       if (probe.hasAudio) {
-        command = `"${FFMPEG_BIN}" -y -i "${videoPath}" -vf "${baseVideoFilter}" -c:v libx264 -pix_fmt yuv420p -r 30 -c:a aac -b:a 128k -movflags +faststart "${outputPath}"`;
+        command = `"${FFMPEG_BIN}" -y -i "${videoPath}" -vf "${baseVideoFilter}" -c:v libx264 -preset veryfast -pix_fmt yuv420p -r 30 -c:a aac -b:a 128k -movflags +faststart "${outputPath}"`;
       } else {
-        command = `"${FFMPEG_BIN}" -y -i "${videoPath}" -f lavfi -i anullsrc=channel_layout=stereo:sample_rate=44100 -vf "${baseVideoFilter}" -map 0:v:0 -map 1:a:0 -c:v libx264 -pix_fmt yuv420p -r 30 -c:a aac -b:a 128k -shortest -movflags +faststart "${outputPath}"`;
+        command = `"${FFMPEG_BIN}" -y -i "${videoPath}" -f lavfi -i anullsrc=channel_layout=stereo:sample_rate=44100 -vf "${baseVideoFilter}" -map 0:v:0 -map 1:a:0 -c:v libx264 -preset veryfast -pix_fmt yuv420p -r 30 -c:a aac -b:a 128k -shortest -movflags +faststart "${outputPath}"`;
       }
     }
 
@@ -1153,31 +1417,339 @@ function sendMainMenu(chatId, message = '🎬 *Creative Reel Maker*\n\nWelcome! 
 function sendHelp(chatId) {
   if (!bot) return;
   const helpText =
-`🎬 *Creative Reel Maker*
+`🎬 *Editorial Typography Studio (Telegram Bot)*
 
-Create an Instagram-ready reel in seconds.
+Create an Instagram-ready news & social reel in seconds.
 
 1️⃣ Click *Create Reel*
 2️⃣ Send a photo or video
 3️⃣ Send your text (supports emojis & flags: 🇿🇦 🇮🇳 🔥 ⚡)
-4️⃣ Bot designs the reel automatically
-5️⃣ Receive the MP4
+4️⃣ Choose your *Design Style* (Editorial, Breaking, Full Screen, Split, Minimal, or Auto)
+5️⃣ Customize typography, badges, headline size, alignment, accent color, and backdrops
+6️⃣ Review confirmation screen and click *Generate Reel*
+7️⃣ Receive the 1080x1920 MP4 ready for Instagram! 🚀
 
-🖼️ *Photo* → 5-second reel (smooth cinematic motion)
-🎥 *Video* → Original duration preserved
+🖼️ *Photo* → 5-second reel with smooth cinematic motion & backdrops
+🎥 *Video* → Original duration & audio preserved with full text overlay
 
-🔤 *Professional Typography & Emojis:*
-• *Noto Color Emoji*: Native rendering of country flags & symbols
+🔤 *Typography & Badges Engine:*
+• *Noto Color Emoji & Twemoji*: High-resolution color flags & symbols
 • *Inter* & *Montserrat*: High-impact editorial typography
+• *Playfair Display*: Refined classical serif
 • Type \`/fonts\` to inspect font status
-• Type \`/font [montserrat|inter|playfair|auto]\` to customize typeface
-
-Then upload it to Instagram. 🚀`;
+• Type \`/font [montserrat|inter|playfair|auto]\` to set default typeface`;
 
   bot.sendMessage(chatId, helpText, {
     parse_mode: 'Markdown',
     ...MAIN_KEYBOARD
   });
+}
+
+async function safeSendOrEdit(chatId, text, replyMarkup, messageId = null) {
+  if (!bot) return;
+  if (messageId) {
+    try {
+      await bot.editMessageText(text, {
+        chat_id: chatId,
+        message_id: messageId,
+        parse_mode: 'Markdown',
+        reply_markup: replyMarkup
+      });
+      return;
+    } catch (_) {}
+  }
+  return bot.sendMessage(chatId, text, {
+    parse_mode: 'Markdown',
+    reply_markup: replyMarkup
+  });
+}
+
+const STYLE_LABELS = {
+  editorial: 'Editorial',
+  breaking: 'Breaking News',
+  fullscreen: 'Full Screen Scrim',
+  split: 'Split News Card',
+  minimal: 'Minimal Briefing',
+  auto: 'Auto (Style-Matched)'
+};
+
+const FONT_LABELS = {
+  auto: 'Auto (Style-Matched)',
+  montserrat: 'Montserrat',
+  inter: 'Inter',
+  playfair: 'Playfair Display'
+};
+
+const SIZE_LABELS = {
+  auto: 'Auto (Dynamic)',
+  small: 'Small (40px)',
+  medium: 'Medium (48px)',
+  large: 'Large (58px)'
+};
+
+const ALIGN_LABELS = {
+  left: 'Left',
+  center: 'Center'
+};
+
+const ACCENT_LABELS = {
+  auto: 'Auto',
+  blue: '🔵 Cyan / Blue',
+  red: '🔴 Red',
+  green: '🟢 Green',
+  orange: '🟠 Orange',
+  purple: '🟣 Purple',
+  white: '⚪ White'
+};
+
+const BACKDROP_LABELS = {
+  original: 'Original',
+  studio: 'News Studio',
+  city: 'Night City',
+  cyber: 'Cyber Grid'
+};
+
+function sendStyleMenu(chatId, messageId = null) {
+  const text = '🎨 *Choose your reel style:*';
+  const keyboard = {
+    inline_keyboard: [
+      [
+        { text: '📰 Editorial', callback_data: 'STYLE_editorial' },
+        { text: '🚨 Breaking News', callback_data: 'STYLE_breaking' }
+      ],
+      [
+        { text: '🎬 Full Screen', callback_data: 'STYLE_fullscreen' },
+        { text: '🧾 Split News', callback_data: 'STYLE_split' }
+      ],
+      [
+        { text: '⚡ Minimal', callback_data: 'STYLE_minimal' },
+        { text: '🎲 Auto Detect', callback_data: 'STYLE_auto' }
+      ],
+      [
+        { text: '✨ Auto Settings', callback_data: 'AUTO_SETTINGS' },
+        { text: '❌ Cancel', callback_data: 'CANCEL' }
+      ]
+    ]
+  };
+  return safeSendOrEdit(chatId, text, keyboard, messageId);
+}
+
+function sendCustomizeMenu(chatId, messageId = null) {
+  const session = userSessions.get(chatId);
+  if (!session) return sendMainMenu(chatId);
+
+  const styleDisplay = STYLE_LABELS[session.style] || 'Editorial';
+  const fontDisplay = FONT_LABELS[session.font] || 'Auto';
+  const sizeDisplay = SIZE_LABELS[session.size] || 'Auto';
+  const alignDisplay = ALIGN_LABELS[session.align] || 'Left';
+  const badgesDisplay = (session.badges && session.badges.length > 0) ? session.badges.join(' ') : 'None';
+  const accentDisplay = ACCENT_LABELS[session.accent] || 'Auto';
+  const backdropDisplay = BACKDROP_LABELS[session.backdrop] || 'Original';
+
+  let text = `🎨 *Reel Customization*\n\n` +
+    `• *Style:* ${styleDisplay}\n` +
+    `• *Font:* ${fontDisplay}\n` +
+    `• *Headline Size:* ${sizeDisplay}\n` +
+    `• *Alignment:* ${alignDisplay}\n` +
+    `• *Badges:* ${badgesDisplay}\n` +
+    `• *Accent Color:* ${accentDisplay}\n` +
+    (session.mediaType === 'photo' ? `• *Backdrop:* ${backdropDisplay}\n` : '') +
+    `\nFine-tune any option below, or click *Review & Generate*:`;
+
+  const rows = [
+    [
+      { text: '🔤 Typography', callback_data: 'MENU_TYPO' },
+      { text: '🏷️ Badges', callback_data: 'MENU_BADGES' }
+    ],
+    [
+      { text: '📏 Size', callback_data: 'MENU_SIZE' },
+      { text: '↔️ Alignment', callback_data: 'MENU_ALIGN' }
+    ],
+    [
+      { text: '🎨 Accent Color', callback_data: 'MENU_ACCENT' },
+      ...(session.mediaType === 'photo' ? [{ text: '🖼️ Backdrop', callback_data: 'MENU_BACKDROP' }] : [])
+    ],
+    [
+      { text: '🎬 Review & Generate', callback_data: 'CONFIRM_SCREEN' }
+    ],
+    [
+      { text: '✨ Auto Settings', callback_data: 'AUTO_SETTINGS' },
+      { text: '❌ Cancel', callback_data: 'CANCEL' }
+    ]
+  ];
+
+  return safeSendOrEdit(chatId, text, { inline_keyboard: rows }, messageId);
+}
+
+function sendTypographyMenu(chatId, messageId = null) {
+  const text = '🔤 *Choose Headline Typography:*';
+  const keyboard = {
+    inline_keyboard: [
+      [{ text: '✨ Auto (Style-Matched)', callback_data: 'SET_FONT_auto' }],
+      [
+        { text: 'Montserrat (Bold)', callback_data: 'SET_FONT_montserrat' },
+        { text: 'Inter (Clean)', callback_data: 'SET_FONT_inter' }
+      ],
+      [{ text: 'Playfair Display (Serif)', callback_data: 'SET_FONT_playfair' }],
+      [{ text: '⬅️ Back to Menu', callback_data: 'BACK_CUSTOMIZE' }]
+    ]
+  };
+  return safeSendOrEdit(chatId, text, keyboard, messageId);
+}
+
+function sendBadgesMenu(chatId, messageId = null) {
+  const session = userSessions.get(chatId);
+  if (!session) return sendMainMenu(chatId);
+
+  const currentBadges = (session.badges && session.badges.length > 0) ? session.badges.join(' ') : 'None';
+  const text = `🏷️ *Quick Badges & Flags*\n\nActive: *${currentBadges}*\n\nTap any badge to add/remove:`;
+  const keyboard = {
+    inline_keyboard: [
+      [
+        { text: '🇮🇳 India', callback_data: 'BADGE_🇮🇳' },
+        { text: '🇺🇸 USA', callback_data: 'BADGE_🇺🇸' },
+        { text: '🇬🇧 UK', callback_data: 'BADGE_🇬🇧' }
+      ],
+      [
+        { text: '🇿🇦 S. Africa', callback_data: 'BADGE_🇿🇦' },
+        { text: '🇪🇺 EU', callback_data: 'BADGE_🇪🇺' },
+        { text: '🇯🇵 Japan', callback_data: 'BADGE_🇯🇵' }
+      ],
+      [
+        { text: '🔴 JUST IN', callback_data: 'BADGE_🔴 JUST IN' },
+        { text: '🚨 BREAKING', callback_data: 'BADGE_🚨 BREAKING' }
+      ],
+      [
+        { text: '🔥 TRENDING', callback_data: 'BADGE_🔥 TRENDING' },
+        { text: '⚡ UPDATE', callback_data: 'BADGE_⚡ UPDATE' }
+      ],
+      [
+        { text: '👑 EXCLUSIVE', callback_data: 'BADGE_👑 EXCLUSIVE' },
+        { text: '🌍 GLOBAL', callback_data: 'BADGE_🌍 GLOBAL' }
+      ],
+      [
+        { text: '🤖 Auto Detect', callback_data: 'BADGE_AUTODETECT' },
+        { text: '🗑️ Clear Badges', callback_data: 'BADGE_CLEAR' }
+      ],
+      [
+        { text: '✅ Done with Badges', callback_data: 'BACK_CUSTOMIZE' }
+      ]
+    ]
+  };
+  return safeSendOrEdit(chatId, text, keyboard, messageId);
+}
+
+function sendSizeMenu(chatId, messageId = null) {
+  const text = '📏 *Choose Headline Size:*';
+  const keyboard = {
+    inline_keyboard: [
+      [{ text: '✨ Auto (Dynamic Scale)', callback_data: 'SET_SIZE_auto' }],
+      [
+        { text: 'Small (40px)', callback_data: 'SET_SIZE_small' },
+        { text: 'Medium (48px)', callback_data: 'SET_SIZE_medium' }
+      ],
+      [{ text: 'Large (58px)', callback_data: 'SET_SIZE_large' }],
+      [{ text: '⬅️ Back to Menu', callback_data: 'BACK_CUSTOMIZE' }]
+    ]
+  };
+  return safeSendOrEdit(chatId, text, keyboard, messageId);
+}
+
+function sendAlignMenu(chatId, messageId = null) {
+  const text = '↔️ *Choose Headline Alignment:*';
+  const keyboard = {
+    inline_keyboard: [
+      [
+        { text: '⬅️ Left Align', callback_data: 'SET_ALIGN_left' },
+        { text: '↔️ Center Align', callback_data: 'SET_ALIGN_center' }
+      ],
+      [{ text: '⬅️ Back to Menu', callback_data: 'BACK_CUSTOMIZE' }]
+    ]
+  };
+  return safeSendOrEdit(chatId, text, keyboard, messageId);
+}
+
+function sendAccentMenu(chatId, messageId = null) {
+  const text = '🎨 *Choose Accent Highlight Color:*';
+  const keyboard = {
+    inline_keyboard: [
+      [{ text: '✨ Auto (Style Default)', callback_data: 'SET_ACCENT_auto' }],
+      [
+        { text: '🔵 Cyan / Blue', callback_data: 'SET_ACCENT_blue' },
+        { text: '🔴 Red', callback_data: 'SET_ACCENT_red' }
+      ],
+      [
+        { text: '🟢 Green', callback_data: 'SET_ACCENT_green' },
+        { text: '🟠 Orange', callback_data: 'SET_ACCENT_orange' }
+      ],
+      [
+        { text: '🟣 Purple', callback_data: 'SET_ACCENT_purple' },
+        { text: '⚪ White', callback_data: 'SET_ACCENT_white' }
+      ],
+      [{ text: '⬅️ Back to Menu', callback_data: 'BACK_CUSTOMIZE' }]
+    ]
+  };
+  return safeSendOrEdit(chatId, text, keyboard, messageId);
+}
+
+function sendBackdropMenu(chatId, messageId = null) {
+  const text = '🖼️ *Choose Video Backdrop Source (Photo Reels):*';
+  const keyboard = {
+    inline_keyboard: [
+      [{ text: '📷 Original Photo', callback_data: 'SET_BACKDROP_original' }],
+      [{ text: '🎙️ News Studio', callback_data: 'SET_BACKDROP_studio' }],
+      [
+        { text: '🌃 Night City', callback_data: 'SET_BACKDROP_city' },
+        { text: '🌐 Cyber Grid', callback_data: 'SET_BACKDROP_cyber' }
+      ],
+      [{ text: '⬅️ Back to Menu', callback_data: 'BACK_CUSTOMIZE' }]
+    ]
+  };
+  return safeSendOrEdit(chatId, text, keyboard, messageId);
+}
+
+function sendConfirmationScreen(chatId, messageId = null) {
+  const session = userSessions.get(chatId);
+  if (!session) return sendMainMenu(chatId);
+
+  const styleDisplay = (session.style && session.style !== 'auto') ? (STYLE_LABELS[session.style] || 'Editorial') : 'Editorial';
+  const fontDisplay = (session.font && session.font !== 'auto') ? (FONT_LABELS[session.font] || 'Auto') : 'Auto';
+  const sizeDisplay = (session.size && session.size !== 'auto') ? (session.size.charAt(0).toUpperCase() + session.size.slice(1)) : 'Auto';
+  const alignDisplay = session.align === 'center' ? 'Center' : 'Left';
+  const badgeDisplay = (session.badges && session.badges.length > 0) ? session.badges.join(' ') : 'None';
+  const accentDisplay = (session.accent && session.accent !== 'auto') ? (session.accent.charAt(0).toUpperCase() + session.accent.slice(1)) : 'Auto';
+  const backdropDisplay = session.mediaType === 'photo'
+    ? (BACKDROP_LABELS[session.backdrop] || 'Original')
+    : 'Original';
+  const durationDisplay = session.mediaType === 'photo'
+    ? '5 sec'
+    : `${Math.round(session.mediaDuration || 5)} sec`;
+
+  const text =
+`🎬 *Reel Settings*
+
+*Style:* ${styleDisplay}
+*Font:* ${fontDisplay}
+*Size:* ${sizeDisplay}
+*Alignment:* ${alignDisplay}
+*Badge:* ${badgeDisplay}
+*Accent:* ${accentDisplay}
+*Backdrop:* ${backdropDisplay}
+*Duration:* ${durationDisplay}
+
+Ready?`;
+
+  const keyboard = {
+    inline_keyboard: [
+      [{ text: '🎬 Generate Reel', callback_data: 'GENERATE_REEL' }],
+      [
+        { text: '⚙️ Change Settings', callback_data: 'CHANGE_SETTINGS' },
+        { text: '❌ Cancel', callback_data: 'CANCEL' }
+      ]
+    ]
+  };
+
+  return safeSendOrEdit(chatId, text, keyboard, messageId);
 }
 
 async function downloadTelegramFile(fileId, extension) {
@@ -1196,7 +1768,7 @@ async function downloadTelegramFile(fileId, extension) {
   return targetPath;
 }
 
-async function processUserReel(chatId, text) {
+async function processUserReel(chatId) {
   const session = userSessions.get(chatId);
   if (!session || !session.mediaPath) {
     sendMainMenu(chatId, '🎬 *Creative Reel Maker*\nPlease click *Create Reel* first.');
@@ -1205,11 +1777,22 @@ async function processUserReel(chatId, text) {
 
   session.state = 'PROCESSING';
   session.updatedAt = Date.now();
-  const fontHint = session.preferredFont || null;
-  const styleHint = session.preferredStyle || null;
+
+  const text = session.rawText || '';
+  const styleHint = session.style && session.style !== 'auto' ? session.style : null;
+  const fontHint = session.font && session.font !== 'auto' ? session.font : (session.preferredFont || null);
+  const renderOptions = {
+    font: fontHint,
+    style: styleHint,
+    size: session.size || 'auto',
+    align: session.align || 'left',
+    accent: session.accent || 'auto',
+    backdrop: session.backdrop || 'original',
+    badges: session.badges || []
+  };
 
   try {
-    await bot.sendMessage(chatId, '⏳ *Creating your reel...*', { parse_mode: 'Markdown' });
+    await bot.sendMessage(chatId, '⏳ *Generating your reel...*', { parse_mode: 'Markdown' });
 
     const outputPath = path.join(
       TEMP_DIR,
@@ -1223,7 +1806,8 @@ async function processUserReel(chatId, text) {
         outputPath,
         text,
         styleHint,
-        fontHint
+        fontHint,
+        options: renderOptions
       });
     } else if (session.mediaType === 'video') {
       await renderVideoReel({
@@ -1231,19 +1815,19 @@ async function processUserReel(chatId, text) {
         outputPath,
         text,
         styleHint,
-        fontHint
+        fontHint,
+        options: renderOptions
       });
     } else {
       throw new Error('Unsupported media type');
     }
 
-    await bot.sendMessage(chatId, '✅ *Reel Ready!*', { parse_mode: 'Markdown' });
-
     await bot.sendVideo(
       chatId,
       outputPath,
       {
-        caption: 'Your reel is ready for Instagram. 🚀',
+        caption: '✅ *Your reel is ready for Instagram. 🚀*',
+        parse_mode: 'Markdown',
         width: 1080,
         height: 1920,
         supports_streaming: true
@@ -1315,7 +1899,6 @@ function initTelegramBot() {
         || 'Polling event';
       const statusCode = (error.response && error.response.statusCode) || error.code || 'STATUS_OK';
 
-      // Gracefully handle instance conflicts (e.g. fast reloads) without spamming error logs
       if (typeof errorMsg === 'string' && (errorMsg.includes('409 Conflict') || errorMsg.includes('terminated by other getUpdates'))) {
         console.warn('[Telegram Bot] Polling conflict detected (overlapping connection). Re-aligning polling loop in 3s...');
         if (bot && typeof bot.isPolling === 'function' && bot.isPolling()) {
@@ -1446,6 +2029,16 @@ function initTelegramBot() {
             state: 'AWAITING_TEXT',
             mediaType: 'photo',
             mediaPath: downloadedPath,
+            mediaDuration: 5,
+            rawText: '',
+            style: 'auto',
+            font: session?.preferredFont || 'auto',
+            size: 'auto',
+            align: 'left',
+            accent: 'auto',
+            backdrop: 'original',
+            badges: [],
+            preferredFont: session?.preferredFont || null,
             updatedAt: Date.now()
           });
 
@@ -1475,11 +2068,22 @@ function initTelegramBot() {
 
           const fileId = msg.video ? msg.video.file_id : msg.document.file_id;
           const downloadedPath = await downloadTelegramFile(fileId, 'mp4');
+          const probe = await probeMedia(downloadedPath);
 
           userSessions.set(chatId, {
             state: 'AWAITING_TEXT',
             mediaType: 'video',
             mediaPath: downloadedPath,
+            mediaDuration: probe.duration || 5,
+            rawText: '',
+            style: 'auto',
+            font: session?.preferredFont || 'auto',
+            size: 'auto',
+            align: 'left',
+            accent: 'auto',
+            backdrop: 'original',
+            badges: [],
+            preferredFont: session?.preferredFont || null,
             updatedAt: Date.now()
           });
 
@@ -1505,13 +2109,23 @@ function initTelegramBot() {
       // Text input stage
       if (session && session.state === 'AWAITING_TEXT') {
         if (text === '⏭️ No Text' || text.toLowerCase() === 'no text') {
-          return processUserReel(chatId, '');
+          session.rawText = '';
+          session.state = 'CONFIRM_SCREEN';
+          return sendConfirmationScreen(chatId);
         }
         if (text === '❌ Cancel' || text.toLowerCase() === 'cancel') {
           clearUserSession(chatId);
           return bot.sendMessage(chatId, '❌ Action cancelled.', MAIN_KEYBOARD);
         }
-        return processUserReel(chatId, text);
+
+        const autoDetected = smartAutoDetect(text);
+        session.rawText = text;
+        session.style = autoDetected.style;
+        session.badges = autoDetected.badges;
+        session.state = 'CHOOSE_STYLE';
+        session.updatedAt = Date.now();
+
+        return sendStyleMenu(chatId);
       }
 
       if (!session) {
@@ -1519,24 +2133,128 @@ function initTelegramBot() {
       }
     });
 
+    // --- Inline Button Callbacks ---
     bot.on('callback_query', async (query) => {
       const chatId = query.message?.chat?.id;
+      const messageId = query.message?.message_id;
       if (!chatId) return;
 
       try {
         await bot.answerCallbackQuery(query.id);
       } catch (_) {}
 
-      if (query.data === 'NO_TEXT') {
-        const session = userSessions.get(chatId);
-        if (session && session.state === 'AWAITING_TEXT') {
-          processUserReel(chatId, '');
-        } else {
-          sendMainMenu(chatId);
-        }
-      } else if (query.data === 'CANCEL') {
+      const data = query.data || '';
+      let session = userSessions.get(chatId);
+
+      if (data === 'CANCEL') {
         clearUserSession(chatId);
-        bot.sendMessage(chatId, '❌ Action cancelled.', MAIN_KEYBOARD);
+        return bot.sendMessage(chatId, '❌ Action cancelled.', MAIN_KEYBOARD);
+      }
+
+      if (data === 'NO_TEXT') {
+        if (session && session.state === 'AWAITING_TEXT') {
+          session.rawText = '';
+          session.state = 'CONFIRM_SCREEN';
+          return sendConfirmationScreen(chatId, messageId);
+        }
+        return sendMainMenu(chatId);
+      }
+
+      if (!session) {
+        return sendMainMenu(chatId);
+      }
+
+      session.updatedAt = Date.now();
+
+      // Style choices
+      if (data.startsWith('STYLE_')) {
+        const style = data.replace('STYLE_', '');
+        session.style = style;
+        session.state = 'CUSTOMIZE';
+        return sendCustomizeMenu(chatId, messageId);
+      }
+
+      if (data === 'AUTO_SETTINGS') {
+        session.style = 'auto';
+        session.state = 'CONFIRM_SCREEN';
+        return sendConfirmationScreen(chatId, messageId);
+      }
+
+      if (data === 'CONFIRM_SCREEN') {
+        session.state = 'CONFIRM_SCREEN';
+        return sendConfirmationScreen(chatId, messageId);
+      }
+
+      if (data === 'CHANGE_SETTINGS' || data === 'BACK_CUSTOMIZE') {
+        session.state = 'CUSTOMIZE';
+        return sendCustomizeMenu(chatId, messageId);
+      }
+
+      // Menus
+      if (data === 'MENU_TYPO') return sendTypographyMenu(chatId, messageId);
+      if (data === 'MENU_BADGES') return sendBadgesMenu(chatId, messageId);
+      if (data === 'MENU_SIZE') return sendSizeMenu(chatId, messageId);
+      if (data === 'MENU_ALIGN') return sendAlignMenu(chatId, messageId);
+      if (data === 'MENU_ACCENT') return sendAccentMenu(chatId, messageId);
+      if (data === 'MENU_BACKDROP') return sendBackdropMenu(chatId, messageId);
+
+      // Set Typography
+      if (data.startsWith('SET_FONT_')) {
+        session.font = data.replace('SET_FONT_', '');
+        return sendCustomizeMenu(chatId, messageId);
+      }
+
+      // Set Size
+      if (data.startsWith('SET_SIZE_')) {
+        session.size = data.replace('SET_SIZE_', '');
+        return sendCustomizeMenu(chatId, messageId);
+      }
+
+      // Set Align
+      if (data.startsWith('SET_ALIGN_')) {
+        session.align = data.replace('SET_ALIGN_', '');
+        return sendCustomizeMenu(chatId, messageId);
+      }
+
+      // Set Accent
+      if (data.startsWith('SET_ACCENT_')) {
+        session.accent = data.replace('SET_ACCENT_', '');
+        return sendCustomizeMenu(chatId, messageId);
+      }
+
+      // Set Backdrop
+      if (data.startsWith('SET_BACKDROP_')) {
+        session.backdrop = data.replace('SET_BACKDROP_', '');
+        return sendCustomizeMenu(chatId, messageId);
+      }
+
+      // Badge toggling
+      if (data === 'BADGE_CLEAR') {
+        session.badges = [];
+        return sendBadgesMenu(chatId, messageId);
+      }
+
+      if (data === 'BADGE_AUTODETECT') {
+        const detected = smartAutoDetect(session.rawText || '');
+        session.badges = detected.badges;
+        return sendBadgesMenu(chatId, messageId);
+      }
+
+      if (data.startsWith('BADGE_')) {
+        const badgeVal = data.replace('BADGE_', '');
+        if (!session.badges) session.badges = [];
+        const idx = session.badges.indexOf(badgeVal);
+        if (idx >= 0) {
+          session.badges.splice(idx, 1);
+        } else {
+          session.badges.push(badgeVal);
+        }
+        return sendBadgesMenu(chatId, messageId);
+      }
+
+      // Generation
+      if (data === 'GENERATE_REEL') {
+        return processUserReel(chatId);
       }
     });
 
@@ -1617,13 +2335,22 @@ app.post('/api/test-generate', upload.single('media'), async (req, res) => {
   const text = req.body.text || '';
   const style = req.body.style || null;
   const font = req.body.font || null;
+  const size = req.body.size || 'auto';
+  const align = req.body.align || 'left';
+  const accent = req.body.accent || 'auto';
+  const backdrop = req.body.backdrop || 'original';
+  let badges = [];
+  if (req.body.badges) {
+    badges = Array.isArray(req.body.badges) ? req.body.badges : (typeof req.body.badges === 'string' ? req.body.badges.split(',').map(s => s.trim()).filter(Boolean) : []);
+  }
+  const renderOptions = { font, style, size, align, accent, backdrop, badges };
   const outputPath = path.join(TEMP_DIR, `test_reel_${Date.now()}.mp4`);
 
   try {
     if (isVideo) {
-      await renderVideoReel({ videoPath: inputPath, outputPath, text, styleHint: style, fontHint: font });
+      await renderVideoReel({ videoPath: inputPath, outputPath, text, styleHint: style, fontHint: font, options: renderOptions });
     } else {
-      await renderPhotoReel({ photoPath: inputPath, outputPath, text, styleHint: style, fontHint: font });
+      await renderPhotoReel({ photoPath: inputPath, outputPath, text, styleHint: style, fontHint: font, options: renderOptions });
     }
 
     res.setHeader('Content-Type', 'video/mp4');
@@ -1713,12 +2440,25 @@ app.post('/api/preview-overlay', async (req, res) => {
     const text = req.body.text || '';
     const style = req.body.style || null;
     const font = req.body.font || null;
+    const size = req.body.size || 'auto';
+    const align = req.body.align || 'left';
+    const accent = req.body.accent || 'auto';
+    let badges = [];
+    if (req.body.badges) {
+      badges = Array.isArray(req.body.badges) ? req.body.badges : (typeof req.body.badges === 'string' ? req.body.badges.split(',').map(s => s.trim()).filter(Boolean) : []);
+    }
 
     if (!text || !text.trim()) {
       return res.status(400).json({ error: 'Text parameter is required' });
     }
 
-    const overlayPath = await generateCreativeOverlay(text.trim(), style || null, { font: font || null });
+    const overlayPath = await generateCreativeOverlay(text.trim(), style || null, {
+      font: font || null,
+      size,
+      align,
+      accent,
+      badges
+    });
     if (!overlayPath || !fs.existsSync(overlayPath)) {
       return res.status(500).json({ error: 'Failed to generate overlay' });
     }
@@ -3637,7 +4377,10 @@ South African President Cyril Ramaphosa arrives in New Delhi for BRICS Summit.</
           body: JSON.stringify({
             text: state.text,
             style: state.style,
-            font: state.font
+            font: state.font,
+            size: state.size,
+            align: state.align,
+            accent: state.accentColor
           })
         });
         if (!resp.ok) throw new Error('Server overlay failed');
@@ -3761,6 +4504,10 @@ South African President Cyril Ramaphosa arrives in New Delhi for BRICS Summit.</
         formData.append('text', state.text);
         formData.append('style', state.style);
         formData.append('font', state.font);
+        formData.append('size', state.size);
+        formData.append('align', state.align);
+        formData.append('accent', state.accentColor);
+        formData.append('backdrop', state.backdrop);
 
         const response = await fetch('/api/test-generate', {
           method: 'POST',
