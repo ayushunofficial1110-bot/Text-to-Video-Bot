@@ -1475,9 +1475,9 @@ async function renderPhotoReel({ photoPath, outputPath, text, styleHint, fontHin
       finalPhotoInput = tempBackdropComposite;
     }
 
-    // 5-second Ken Burns zoom-in animation (150 frames @ 30 FPS)
+    // 5-second Ken Burns zoom-in animation (150 frames @ 30 FPS, optimized resolution for speed and low RAM)
     const kenBurnsFilter =
-      "scale=2160:3840:force_original_aspect_ratio=increase,crop=2160:3840,zoompan=z='min(zoom+0.0008,1.12)':d=150:x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':s=1080x1920:fps=30";
+      "scale=1200:2134:force_original_aspect_ratio=increase,crop=1200:2134,zoompan=z='min(zoom+0.0008,1.12)':d=150:x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':s=1080x1920:fps=30";
 
     let args = [];
 
@@ -2061,7 +2061,16 @@ Ready?`;
 }
 
 async function downloadTelegramFile(fileId, extension) {
-  const fileLink = await bot.getFileLink(fileId);
+  let fileLink;
+  try {
+    fileLink = await bot.getFileLink(fileId);
+  } catch (err) {
+    if (err.message && (err.message.includes('file is too big') || err.message.includes('400'))) {
+      throw new Error('FILE_TOO_LARGE: Telegram bot API only supports downloading files up to 20MB.');
+    }
+    throw err;
+  }
+
   const targetPath = path.join(
     TEMP_DIR,
     `tg_${Date.now()}_${Math.random().toString(36).substring(2, 7)}.${extension}`
@@ -2434,6 +2443,29 @@ function initTelegramBot() {
 
           const photo = msg.photo[msg.photo.length - 1];
           const downloadedPath = await downloadTelegramFile(photo.file_id, 'jpg');
+          const caption = (msg.caption || '').trim();
+
+          if (caption) {
+            const detected = smartAutoDetect(caption);
+            userSessions.set(chatId, {
+              state: 'CHOOSE_STYLE',
+              mediaType: 'photo',
+              mediaPath: downloadedPath,
+              mediaDuration: 5,
+              rawText: caption,
+              style: detected.style,
+              font: session?.preferredFont || 'auto',
+              size: 'auto',
+              align: 'left',
+              accent: 'auto',
+              backdrop: 'original',
+              badges: detected.badges,
+              preferredFont: session?.preferredFont || null,
+              updatedAt: Date.now()
+            });
+
+            return sendStyleMenu(chatId);
+          }
 
           userSessions.set(chatId, {
             state: 'AWAITING_TEXT',
@@ -2461,13 +2493,12 @@ function initTelegramBot() {
             }
           );
         } catch (err) {
-          console.error('[Photo Download Failed]:', err);
+          console.error('[Photo Download Failed]:', err.message);
           clearUserSession(chatId);
-          return bot.sendMessage(
-            chatId,
-            '❌ *Couldn\'t create the reel. Please try another photo or video.*',
-            { parse_mode: 'Markdown', ...MAIN_KEYBOARD }
-          );
+          const errorMsg = err.message && err.message.includes('FILE_TOO_LARGE')
+            ? '⚠️ *Photo is too large.* Telegram Bot API supports files up to 20MB. Please send a compressed image.'
+            : '❌ *Couldn\'t process the photo. Please try another photo or video.*';
+          return bot.sendMessage(chatId, errorMsg, { parse_mode: 'Markdown', ...MAIN_KEYBOARD });
         }
       }
 
@@ -2479,6 +2510,29 @@ function initTelegramBot() {
           const fileId = msg.video ? msg.video.file_id : msg.document.file_id;
           const downloadedPath = await downloadTelegramFile(fileId, 'mp4');
           const probe = await probeMedia(downloadedPath);
+          const caption = (msg.caption || '').trim();
+
+          if (caption) {
+            const detected = smartAutoDetect(caption);
+            userSessions.set(chatId, {
+              state: 'CHOOSE_STYLE',
+              mediaType: 'video',
+              mediaPath: downloadedPath,
+              mediaDuration: probe.duration || 5,
+              rawText: caption,
+              style: detected.style,
+              font: session?.preferredFont || 'auto',
+              size: 'auto',
+              align: 'left',
+              accent: 'auto',
+              backdrop: 'original',
+              badges: detected.badges,
+              preferredFont: session?.preferredFont || null,
+              updatedAt: Date.now()
+            });
+
+            return sendStyleMenu(chatId);
+          }
 
           userSessions.set(chatId, {
             state: 'AWAITING_TEXT',
@@ -2506,13 +2560,12 @@ function initTelegramBot() {
             }
           );
         } catch (err) {
-          console.error('[Video Download Failed]:', err);
+          console.error('[Video Download Failed]:', err.message);
           clearUserSession(chatId);
-          return bot.sendMessage(
-            chatId,
-            '❌ *Couldn\'t create the reel. Please try another photo or video.*',
-            { parse_mode: 'Markdown', ...MAIN_KEYBOARD }
-          );
+          const errorMsg = err.message && err.message.includes('FILE_TOO_LARGE')
+            ? '⚠️ *Video is too large!* Telegram Bot API only allows downloading videos up to 20MB. Please send a shorter video clip or compress it under 20MB.'
+            : '❌ *Couldn\'t process the video. Please try another photo or video.*';
+          return bot.sendMessage(chatId, errorMsg, { parse_mode: 'Markdown', ...MAIN_KEYBOARD });
         }
       }
 
