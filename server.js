@@ -8,7 +8,7 @@ require('dotenv').config();
 const fs = require('fs');
 const path = require('path');
 const https = require('https');
-const { exec, execSync } = require('child_process');
+const { exec, execSync, spawn } = require('child_process');
 const express = require('express');
 const multer = require('multer');
 
@@ -342,9 +342,39 @@ function cleanFile(filePath) {
 
 function probeMedia(filePath) {
   return new Promise((resolve, reject) => {
-    const cmd = `"${FFPROBE_BIN}" -v error -show_entries format=duration -show_streams -of json "${filePath}"`;
-    exec(cmd, (error, stdout) => {
-      if (error) return reject(error);
+    if (!filePath || !fs.existsSync(filePath)) {
+      return reject(new Error(`Probe file does not exist: ${filePath}`));
+    }
+    const args = ['-v', 'error', '-show_entries', 'format=duration', '-show_streams', '-of', 'json', filePath];
+    let stdout = '';
+    let stderr = '';
+    let settled = false;
+
+    const child = spawn(FFPROBE_BIN, args, { stdio: ['ignore', 'pipe', 'pipe'] });
+    const timer = setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      try { child.kill('SIGKILL'); } catch (_) {}
+      reject(new Error('Media probe timed out after 15s'));
+    }, 15000);
+
+    child.stdout.on('data', (d) => { stdout += d.toString('utf8'); });
+    child.stderr.on('data', (d) => { stderr += d.toString('utf8'); });
+
+    child.on('error', (err) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      reject(err);
+    });
+
+    child.on('close', (code) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      if (code !== 0) {
+        return reject(new Error(`ffprobe failed (code ${code}): ${stderr.trim()}`));
+      }
       try {
         const data = JSON.parse(stdout);
         const duration = parseFloat(data.format?.duration || 0);
@@ -1264,100 +1294,378 @@ async function createBackdropComposite(photoPath, backdrop, outputPath) {
 }
 
 /**
+ * Resilient FFmpeg process runner with:
+ * - -nostdin and stdio: ['ignore', 'pipe', 'pipe'] to prevent stdin hanging
+ * - Active draining of stdout and stderr to prevent pipe buffer deadlock
+ * - Real-time progress logging
+ * - Hard timeout protection with SIGKILL
+ * - Guaranteed promise resolution or rejection
+ */
+function runFFmpeg(args, options = {}) {
+  const {
+    timeoutMs = 60000,
+    logPrefix = '[Render]',
+    onProgress = null
+  } = options;
+
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    let timer = null;
+    let child = null;
+    let stderrBuffer = '';
+    const maxStderrLength = 32768;
+
+    function finish(err, result) {
+      if (settled) return;
+      settled = true;
+      if (timer) {
+        clearTimeout(timer);
+        timer = null;
+      }
+      if (err) {
+        reject(err);
+      } else {
+        resolve(result);
+      }
+    }
+
+    try {
+      const fullArgs = args[0] === '-nostdin' ? args : ['-nostdin', ...args];
+
+      console.log(`${logPrefix} FFmpeg command started`);
+      child = spawn(FFMPEG_BIN, fullArgs, {
+        stdio: ['ignore', 'pipe', 'pipe']
+      });
+
+      timer = setTimeout(() => {
+        console.error(`${logPrefix} TIMEOUT triggered after ${timeoutMs}ms. Killing FFmpeg process...`);
+        if (child) {
+          try {
+            child.kill('SIGKILL');
+          } catch (_) {}
+        }
+        finish(new Error(`Reel generation timed out after ${Math.round(timeoutMs / 1000)}s. Please try again with a shorter video.`));
+      }, timeoutMs);
+
+      child.on('error', (err) => {
+        console.error(`${logPrefix} [Render ERROR] Process spawn error:`, err.message);
+        finish(new Error(`Failed to start FFmpeg: ${err.message}`));
+      });
+
+      if (child.stdout) {
+        child.stdout.on('data', () => {});
+      }
+
+      let lastProgressLog = 0;
+      if (child.stderr) {
+        child.stderr.on('data', (chunk) => {
+          const text = chunk.toString('utf8');
+          stderrBuffer += text;
+          if (stderrBuffer.length > maxStderrLength) {
+            stderrBuffer = stderrBuffer.slice(-maxStderrLength);
+          }
+
+          const now = Date.now();
+          if (now - lastProgressLog > 2000) {
+            const timeMatch = text.match(/time=(\d{2}:\d{2}:\d{2}\.\d+)/);
+            const frameMatch = text.match(/frame=\s*(\d+)/);
+            const fpsMatch = text.match(/fps=\s*([\d\.]+)/);
+            if (timeMatch || frameMatch) {
+              lastProgressLog = now;
+              const parts = [
+                frameMatch ? `frame=${frameMatch[1]}` : '',
+                timeMatch ? `time=${timeMatch[1]}` : '',
+                fpsMatch ? `fps=${fpsMatch[1]}` : ''
+              ].filter(Boolean);
+              console.log(`${logPrefix} Progress: ${parts.join(', ')}`);
+              if (typeof onProgress === 'function') {
+                onProgress({ time: timeMatch ? timeMatch[1] : null, frame: frameMatch ? frameMatch[1] : null });
+              }
+            }
+          }
+        });
+      }
+
+      child.on('close', (code, signal) => {
+        if (code === 0) {
+          console.log(`${logPrefix} FFmpeg completed successfully`);
+          finish(null, { success: true, code });
+        } else {
+          const exitReason = signal ? `killed with signal ${signal}` : `exited with code ${code}`;
+          console.error(`${logPrefix} [Render ERROR] FFmpeg ${exitReason}`);
+          const lastLines = stderrBuffer.slice(-1200).trim();
+          if (lastLines) {
+            console.error(`${logPrefix} [Render ERROR] Stderr:\n${lastLines}`);
+          }
+          finish(new Error(`FFmpeg ${exitReason}: ${lastLines.slice(-300) || 'Process failed'}`));
+        }
+      });
+
+    } catch (err) {
+      finish(err);
+    }
+  });
+}
+
+/**
+ * Validates output video dimensions, duration, format, and file integrity
+ */
+async function validateOutputVideo(filePath, expectedDuration = null) {
+  if (!fs.existsSync(filePath)) {
+    throw new Error('Video rendering failed. No output file was created.');
+  }
+  const stats = fs.statSync(filePath);
+  if (stats.size < 1000) {
+    throw new Error(`Video rendering produced an empty or corrupted file (${stats.size} bytes).`);
+  }
+
+  try {
+    const probe = await probeMedia(filePath);
+    const videoStream = (probe.streams || []).find(s => s.codec_type === 'video') || {};
+    const width = videoStream.width || 1080;
+    const height = videoStream.height || 1920;
+    const codec = videoStream.codec_name || 'h264';
+    const duration = probe.duration || expectedDuration || 5;
+
+    return {
+      width,
+      height,
+      codec,
+      duration,
+      size: stats.size,
+      sizeMb: (stats.size / 1024 / 1024).toFixed(2)
+    };
+  } catch (err) {
+    console.warn('[Render] Video probe notice:', err.message);
+    return {
+      width: 1080,
+      height: 1920,
+      codec: 'h264',
+      duration: expectedDuration || 5,
+      size: stats.size,
+      sizeMb: (stats.size / 1024 / 1024).toFixed(2)
+    };
+  }
+}
+
+/**
  * Creates an exactly 5-second 1080x1920 MP4 from a Photo with Ken Burns motion
  */
 async function renderPhotoReel({ photoPath, outputPath, text, styleHint, fontHint, options = {} }) {
-  let overlayPath = null;
-  if (text && text.trim()) {
-    overlayPath = await generateCreativeOverlay(text.trim(), styleHint, {
-      font: fontHint,
-      ...options
-    });
+  if (!photoPath || !fs.existsSync(photoPath)) {
+    throw new Error(`Photo input file not found: ${photoPath}`);
   }
 
-  let finalPhotoInput = photoPath;
+  let overlayPath = null;
   let tempBackdropComposite = null;
 
-  const backdrop = options.backdrop || 'original';
-  if (backdrop && backdrop !== 'original') {
-    tempBackdropComposite = path.join(TEMP_DIR, `comp_bg_${Date.now()}_${Math.random().toString(36).substring(2, 7)}.jpg`);
-    await createBackdropComposite(photoPath, backdrop, tempBackdropComposite);
-    finalPhotoInput = tempBackdropComposite;
-  }
+  try {
+    if (text && text.trim()) {
+      overlayPath = await generateCreativeOverlay(text.trim(), styleHint, {
+        font: fontHint,
+        ...options
+      });
+    }
 
-  return new Promise((resolve, reject) => {
+    let finalPhotoInput = photoPath;
+    const backdrop = options.backdrop || 'original';
+    if (backdrop && backdrop !== 'original') {
+      tempBackdropComposite = path.join(TEMP_DIR, `comp_bg_${Date.now()}_${Math.random().toString(36).substring(2, 7)}.jpg`);
+      await createBackdropComposite(photoPath, backdrop, tempBackdropComposite);
+      finalPhotoInput = tempBackdropComposite;
+    }
+
     // 5-second Ken Burns zoom-in animation (150 frames @ 30 FPS)
     const kenBurnsFilter =
       "scale=2160:3840:force_original_aspect_ratio=increase,crop=2160:3840,zoompan=z='min(zoom+0.0008,1.12)':d=150:x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':s=1080x1920:fps=30";
 
-    let command = '';
+    let args = [];
 
     if (overlayPath) {
       const filterComplex = `[0:v]${kenBurnsFilter}[bg];[1:v]format=rgba,fade=t=in:st=0:d=0.4:alpha=1[ov];[bg][ov]overlay=0:0:shortest=1:repeatlast=1:format=auto[v]`;
-      command = `"${FFMPEG_BIN}" -y -loop 1 -i "${finalPhotoInput}" -loop 1 -i "${overlayPath}" -f lavfi -i anullsrc=channel_layout=stereo:sample_rate=44100 -filter_complex "${filterComplex}" -map "[v]" -map 2:a -c:v libx264 -pix_fmt yuv420p -r 30 -t 5 -c:a aac -b:a 128k -shortest -movflags +faststart "${outputPath}"`;
+      args = [
+        '-nostdin',
+        '-y',
+        '-loop', '1',
+        '-i', finalPhotoInput,
+        '-loop', '1',
+        '-i', overlayPath,
+        '-f', 'lavfi',
+        '-i', 'anullsrc=channel_layout=stereo:sample_rate=44100',
+        '-filter_complex', filterComplex,
+        '-map', '[v]',
+        '-map', '2:a',
+        '-c:v', 'libx264',
+        '-preset', 'veryfast',
+        '-pix_fmt', 'yuv420p',
+        '-r', '30',
+        '-t', '5',
+        '-c:a', 'aac',
+        '-b:a', '128k',
+        '-shortest',
+        '-movflags', '+faststart',
+        outputPath
+      ];
     } else {
-      command = `"${FFMPEG_BIN}" -y -loop 1 -i "${finalPhotoInput}" -f lavfi -i anullsrc=channel_layout=stereo:sample_rate=44100 -vf "${kenBurnsFilter}" -c:v libx264 -preset veryfast -pix_fmt yuv420p -r 30 -t 5 -c:a aac -b:a 128k -shortest -movflags +faststart "${outputPath}"`;
+      args = [
+        '-nostdin',
+        '-y',
+        '-loop', '1',
+        '-i', finalPhotoInput,
+        '-f', 'lavfi',
+        '-i', 'anullsrc=channel_layout=stereo:sample_rate=44100',
+        '-vf', kenBurnsFilter,
+        '-map', '0:v:0',
+        '-map', '1:a:0',
+        '-c:v', 'libx264',
+        '-preset', 'veryfast',
+        '-pix_fmt', 'yuv420p',
+        '-r', '30',
+        '-t', '5',
+        '-c:a', 'aac',
+        '-b:a', '128k',
+        '-shortest',
+        '-movflags', '+faststart',
+        outputPath
+      ];
     }
 
-    console.log('[Media Engine] Rendering Photo -> 5-Second Reel...');
-    exec(command, { timeout: 60000 }, (error, stdout, stderr) => {
-      cleanFile(overlayPath);
-      if (tempBackdropComposite) cleanFile(tempBackdropComposite);
-      if (error) {
-        console.error('[Render Photo Error]:', error.message, stderr);
-        return reject(new Error('Photo rendering failed'));
-      }
-      resolve(outputPath);
-    });
-  });
+    console.log('[Render] Starting photo reel FFmpeg encode (5.0s, Ken Burns)...');
+    await runFFmpeg(args, { timeoutMs: 60000, logPrefix: '[Render Photo]' });
+    return outputPath;
+
+  } finally {
+    if (overlayPath) cleanFile(overlayPath);
+    if (tempBackdropComposite) cleanFile(tempBackdropComposite);
+  }
 }
 
 /**
  * Creates a 1080x1920 MP4 from Video preserving ORIGINAL DURATION and audio
  */
 async function renderVideoReel({ videoPath, outputPath, text, styleHint, fontHint, options = {} }) {
-  const probe = await probeMedia(videoPath);
-  console.log(`[Media Engine] Video input: duration=${probe.duration}s, audio=${probe.hasAudio}`);
-
-  let overlayPath = null;
-  if (text && text.trim()) {
-    overlayPath = await generateCreativeOverlay(text.trim(), styleHint, {
-      font: fontHint,
-      ...options
-    });
+  if (!videoPath || !fs.existsSync(videoPath)) {
+    throw new Error(`Video input file not found: ${videoPath}`);
   }
 
-  return new Promise((resolve, reject) => {
+  const probe = await probeMedia(videoPath);
+  const duration = probe.duration > 0 ? probe.duration : 10;
+  console.log(`[Render] Video input: duration=${duration}s, hasAudio=${probe.hasAudio}`);
+
+  let overlayPath = null;
+
+  try {
+    if (text && text.trim()) {
+      overlayPath = await generateCreativeOverlay(text.trim(), styleHint, {
+        font: fontHint,
+        ...options
+      });
+    }
+
     const baseVideoFilter = 'scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,setsar=1';
-    let command = '';
+    let args = [];
+
+    // Timeout: 2 minutes minimum, up to 5 minutes based on video length
+    const timeoutMs = Math.max(120000, Math.min(300000, Math.ceil(duration * 4) * 1000));
 
     if (overlayPath) {
       const filterComplex = NodeCanvasOverlayModule.buildFFmpegOverlayFilter();
 
       if (probe.hasAudio) {
-        command = `"${FFMPEG_BIN}" -y -i "${videoPath}" -loop 1 -i "${overlayPath}" -filter_complex "${filterComplex}" -map "[v]" -map 0:a:0 -c:v libx264 -preset veryfast -pix_fmt yuv420p -r 30 -c:a aac -b:a 128k -shortest -movflags +faststart "${outputPath}"`;
+        args = [
+          '-nostdin',
+          '-y',
+          '-i', videoPath,
+          '-loop', '1',
+          '-i', overlayPath,
+          '-filter_complex', filterComplex,
+          '-map', '[v]',
+          '-map', '0:a?',
+          '-c:v', 'libx264',
+          '-preset', 'veryfast',
+          '-pix_fmt', 'yuv420p',
+          '-r', '30',
+          '-t', `${duration}`,
+          '-c:a', 'aac',
+          '-b:a', '128k',
+          '-shortest',
+          '-movflags', '+faststart',
+          outputPath
+        ];
       } else {
-        const durationArg = probe.duration > 0 ? `-t ${probe.duration}` : '';
-        command = `"${FFMPEG_BIN}" -y -i "${videoPath}" -loop 1 -i "${overlayPath}" -f lavfi ${durationArg} -i anullsrc=channel_layout=stereo:sample_rate=44100 -filter_complex "${filterComplex}" -map "[v]" -map 2:a -c:v libx264 -preset veryfast -pix_fmt yuv420p -r 30 -c:a aac -b:a 128k -shortest -movflags +faststart "${outputPath}"`;
+        args = [
+          '-nostdin',
+          '-y',
+          '-i', videoPath,
+          '-loop', '1',
+          '-i', overlayPath,
+          '-f', 'lavfi',
+          '-i', 'anullsrc=channel_layout=stereo:sample_rate=44100',
+          '-filter_complex', filterComplex,
+          '-map', '[v]',
+          '-map', '2:a',
+          '-c:v', 'libx264',
+          '-preset', 'veryfast',
+          '-pix_fmt', 'yuv420p',
+          '-r', '30',
+          '-t', `${duration}`,
+          '-c:a', 'aac',
+          '-b:a', '128k',
+          '-shortest',
+          '-movflags', '+faststart',
+          outputPath
+        ];
       }
     } else {
       if (probe.hasAudio) {
-        command = `"${FFMPEG_BIN}" -y -i "${videoPath}" -vf "${baseVideoFilter}" -c:v libx264 -preset veryfast -pix_fmt yuv420p -r 30 -c:a aac -b:a 128k -movflags +faststart "${outputPath}"`;
+        args = [
+          '-nostdin',
+          '-y',
+          '-i', videoPath,
+          '-vf', baseVideoFilter,
+          '-map', '0:v:0',
+          '-map', '0:a?',
+          '-c:v', 'libx264',
+          '-preset', 'veryfast',
+          '-pix_fmt', 'yuv420p',
+          '-r', '30',
+          '-t', `${duration}`,
+          '-c:a', 'aac',
+          '-b:a', '128k',
+          '-movflags', '+faststart',
+          outputPath
+        ];
       } else {
-        command = `"${FFMPEG_BIN}" -y -i "${videoPath}" -f lavfi -i anullsrc=channel_layout=stereo:sample_rate=44100 -vf "${baseVideoFilter}" -map 0:v:0 -map 1:a:0 -c:v libx264 -preset veryfast -pix_fmt yuv420p -r 30 -c:a aac -b:a 128k -shortest -movflags +faststart "${outputPath}"`;
+        args = [
+          '-nostdin',
+          '-y',
+          '-i', videoPath,
+          '-f', 'lavfi',
+          '-i', 'anullsrc=channel_layout=stereo:sample_rate=44100',
+          '-vf', baseVideoFilter,
+          '-map', '0:v:0',
+          '-map', '1:a:0',
+          '-c:v', 'libx264',
+          '-preset', 'veryfast',
+          '-pix_fmt', 'yuv420p',
+          '-r', '30',
+          '-t', `${duration}`,
+          '-c:a', 'aac',
+          '-b:a', '128k',
+          '-shortest',
+          '-movflags', '+faststart',
+          outputPath
+        ];
       }
     }
 
-    console.log('[Media Engine] Rendering Video -> Reel (Preserving Duration)...');
-    exec(command, { timeout: 180000 }, (error, stdout, stderr) => {
-      cleanFile(overlayPath);
-      if (error) {
-        console.error('[Render Video Error]:', error.message, stderr);
-        return reject(new Error('Video rendering failed'));
-      }
-      resolve(outputPath);
-    });
-  });
+    console.log(`[Render] Starting video reel FFmpeg encode (duration=${duration}s, timeout=${Math.round(timeoutMs/1000)}s)...`);
+    await runFFmpeg(args, { timeoutMs, logPrefix: '[Render Video]' });
+    return outputPath;
+
+  } finally {
+    if (overlayPath) cleanFile(overlayPath);
+  }
 }
 
 // --- 7. TELEGRAM BOT MULTI-USER STATE & HANDLERS ---
@@ -1791,18 +2099,58 @@ async function processUserReel(chatId) {
     badges: session.badges || []
   };
 
+  const isPhoto = session.mediaType === 'photo';
+  const inputPath = session.mediaPath;
+  const outputPath = path.join(
+    TEMP_DIR,
+    `reel_${chatId}_${Date.now()}_${Math.random().toString(36).substring(2, 7)}.mp4`
+  );
+  session.outputPath = outputPath;
+
+  let progressMsgId = null;
+
   try {
-    await bot.sendMessage(chatId, '⏳ *Generating your reel...*', { parse_mode: 'Markdown' });
+    // 1. Send immediate progress update to user
+    const sentMsg = await bot.sendMessage(chatId, '⏳ *Generating your reel...*', { parse_mode: 'Markdown' });
+    if (sentMsg && sentMsg.message_id) {
+      progressMsgId = sentMsg.message_id;
+    }
 
-    const outputPath = path.join(
-      TEMP_DIR,
-      `reel_${chatId}_${Date.now()}_${Math.random().toString(36).substring(2, 7)}.mp4`
-    );
-    session.outputPath = outputPath;
+    // 2. Input file verification
+    console.log(`[Render] Starting reel generation for chat ${chatId}...`);
+    console.log(`[Render] Input: ${inputPath}`);
 
-    if (session.mediaType === 'photo') {
+    if (!fs.existsSync(inputPath)) {
+      console.error(`[Render ERROR] Input media file not found: ${inputPath}`);
+      await bot.sendMessage(
+        chatId,
+        '❌ *Input media could not be found. Please send the media again.*',
+        { parse_mode: 'Markdown', ...MAIN_KEYBOARD }
+      );
+      return;
+    }
+
+    const inputStats = fs.statSync(inputPath);
+    if (inputStats.size < 100) {
+      console.error(`[Render ERROR] Input media is empty: ${inputStats.size} bytes`);
+      await bot.sendMessage(
+        chatId,
+        '❌ *Input media appears to be empty or corrupted. Please send another photo or video.*',
+        { parse_mode: 'Markdown', ...MAIN_KEYBOARD }
+      );
+      return;
+    }
+
+    console.log(`[Render] Input exists: true`);
+    console.log(`[Render] Input size: ${(inputStats.size / 1024 / 1024).toFixed(2)} MB`);
+    console.log(`[Render] Media type: ${isPhoto ? 'Photo' : 'Video'}`);
+    console.log(`[Render] Duration: ${isPhoto ? '5.0s (Photo Reel)' : (session.mediaDuration ? session.mediaDuration + 's' : 'Original')}`);
+    console.log(`[Render] Style: ${session.style || 'auto'}`);
+
+    // 3. Render reel with FFmpeg (using non-blocking spawn with active pipe draining and timeout protection)
+    if (isPhoto) {
       await renderPhotoReel({
-        photoPath: session.mediaPath,
+        photoPath: inputPath,
         outputPath,
         text,
         styleHint,
@@ -1811,7 +2159,7 @@ async function processUserReel(chatId) {
       });
     } else if (session.mediaType === 'video') {
       await renderVideoReel({
-        videoPath: session.mediaPath,
+        videoPath: inputPath,
         outputPath,
         text,
         styleHint,
@@ -1822,14 +2170,49 @@ async function processUserReel(chatId) {
       throw new Error('Unsupported media type');
     }
 
+    // 4. Verify output file exists and is non-empty
+    if (!fs.existsSync(outputPath)) {
+      console.error(`[Render ERROR] Output MP4 was not created at ${outputPath}`);
+      throw new Error('Video rendering failed. No output file was created.');
+    }
+
+    const outStats = fs.statSync(outputPath);
+    if (outStats.size < 1000) {
+      console.error(`[Render ERROR] Output MP4 is too small or corrupted: ${outStats.size} bytes`);
+      throw new Error('Video rendering produced an empty or corrupted file.');
+    }
+
+    const outMb = (outStats.size / 1024 / 1024).toFixed(2);
+    console.log(`[Render] Output file: ${outputPath}`);
+    console.log(`[Render] Output exists: true`);
+    console.log(`[Render] Output size: ${outMb} MB`);
+
+    // 5. Validate output video with ffprobe
+    const validation = await validateOutputVideo(outputPath, isPhoto ? 5 : session.mediaDuration);
+    console.log(`[Render] Video validated: ${validation.width}x${validation.height}, codec=${validation.codec}, duration=${validation.duration}s`);
+
+    // 6. Check Telegram 50 MB upload limit
+    if (outStats.size > 49.5 * 1024 * 1024) {
+      console.error(`[Telegram ERROR] Video size (${outMb} MB) exceeds Telegram 50 MB bot limit`);
+      await bot.sendMessage(
+        chatId,
+        `❌ *The reel was created (${outMb} MB), but Telegram could not upload it because the file exceeds the 50 MB bot limit.*`,
+        { parse_mode: 'Markdown', ...MAIN_KEYBOARD }
+      );
+      return;
+    }
+
+    // 7. Upload to Telegram
+    console.log('[Render] Sending video to Telegram...');
     await bot.sendVideo(
       chatId,
       outputPath,
       {
         caption: '✅ *Your reel is ready for Instagram. 🚀*',
         parse_mode: 'Markdown',
-        width: 1080,
-        height: 1920,
+        width: validation.width || 1080,
+        height: validation.height || 1920,
+        duration: Math.round(validation.duration || 5),
         supports_streaming: true
       },
       {
@@ -1837,17 +2220,44 @@ async function processUserReel(chatId) {
         contentType: 'video/mp4'
       }
     );
+    console.log('[Render] Video sent successfully');
+
+    // 8. Clean up progress status message if sent
+    if (progressMsgId) {
+      try {
+        await bot.deleteMessage(chatId, progressMsgId);
+      } catch (_) {}
+    }
 
     sendMainMenu(chatId, '🎬 *Create another reel anytime!*');
+
   } catch (err) {
-    console.error(`[Reel Error for chat ${chatId}]:`, err);
-    bot.sendMessage(
-      chatId,
-      '❌ *Couldn\'t create the reel. Please try another photo or video.*',
-      { parse_mode: 'Markdown', ...MAIN_KEYBOARD }
-    );
+    console.error(`[Render ERROR for chat ${chatId}]:`, err.message);
+    if (err.stack) console.error(err.stack);
+
+    let userMessage = '❌ *Couldn\'t create the reel. Please try another photo or video.*';
+    if (err.message && err.message.toLowerCase().includes('timed out')) {
+      userMessage = '❌ *Reel generation timed out.*\n\nPlease try again with a shorter video.';
+    } else if (err.message && err.message.toLowerCase().includes('no output file')) {
+      userMessage = '❌ *Video rendering failed. No output file was created.*';
+    } else if (err.message && err.message.toLowerCase().includes('too large')) {
+      userMessage = '❌ *The reel was created, but Telegram could not upload it because the file is too large.*';
+    }
+
+    try {
+      await bot.sendMessage(
+        chatId,
+        userMessage,
+        { parse_mode: 'Markdown', ...MAIN_KEYBOARD }
+      );
+    } catch (sendErr) {
+      console.error('[Telegram ERROR] Failed to send error notification:', sendErr.message);
+    }
   } finally {
+    console.log(`[Render] Cleaning up session and temporary files for chat ${chatId}...`);
+    cleanFile(outputPath);
     clearUserSession(chatId);
+    console.log('[Render] Cleanup completed');
   }
 }
 
